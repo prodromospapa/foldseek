@@ -16,7 +16,6 @@ from collections import deque
 # third-party
 import pandas as pd
 import wget
-from goatools.obo_parser import GODag
 from tqdm import tqdm
 import xml.etree.ElementTree as etree
 
@@ -33,8 +32,6 @@ UNIPROT_DB_FILE = 'uniprot_index.db'
 RESULTS_FILE = 'foldseek_combined_results.pkl'
 ANNOTATED_FILE = 'foldseek_combined_results_with_info.pkl'
 PROGRESS_FILE = 'processed_uniprot_ids.pkl'
-GO_HIERARCHY_FILE = 'go_hierarchy.pkl'
-
 # Memory thresholds (as fraction of total RAM)
 FLUSH_RAM_PCT         = 0.20   # Flush to DB when RAM usage hits this
 MEMORY_HARD_LIMIT_PCT = 0.40   # Crash if usage exceeds this
@@ -164,17 +161,9 @@ def load_go_dict():
         return pickle.load(f)
 
 
-def load_go_hierarchy():
-    """Load GO ID -> GO ancestor list mapping from prebuilt cache."""
-    if not os.path.exists(GO_HIERARCHY_FILE):
-        raise FileNotFoundError(f'{GO_HIERARCHY_FILE} not found. Run 5.subcell_hierarchy_uniprot.py first.')
-    with open(GO_HIERARCHY_FILE, 'rb') as f:
-        return pickle.load(f)
-
-
 def ensure_subcell_assets():
     """Ensure required subcell ontology assets exist; build them via 5.1 if needed."""
-    required = ['subcell.txt', 'go-basic.obo', 'subcell_hierarchy.pkl', 'go_dict.pkl', GO_HIERARCHY_FILE]
+    required = ['subcell.txt', 'subcell_hierarchy.pkl', 'go_dict.pkl']
     missing = [p for p in required if not os.path.exists(p)]
     if not missing:
         return
@@ -214,66 +203,41 @@ def _expand_subcell_terms(locations, uniprot_dict):
     return expanded
 
 
-# GO expansion cache to avoid redundant traversals
-_GO_EXPANSION_CACHE = {}
-
-def _expand_go_annotations(go_entries, go_hierarchy, godag=None):
-    """Expand GO cellular-component annotations through the prebuilt GO hierarchy."""
-    global _GO_EXPANSION_CACHE
-    expanded = []
+def _translate_go_to_uniprot(go_entries, go_dict):
+    """Translate GO IDs to UniProt subcellular terms using go_dict. Untranslatable terms are discarded."""
+    translated = []
     seen = set()
-
     for go in go_entries:
         go_id = go.get('go_id')
-        if not go_id or go_id in seen:
+        if not go_id:
             continue
-
-        # Check cache first
-        if go_id not in _GO_EXPANSION_CACHE:
-            cached_expansion = []
-            ancestor_entries = go_hierarchy.get(go_id, [{'go_id': go_id, 'term': go_id}])
-            for entry in ancestor_entries:
-                if isinstance(entry, dict):
-                    curr_id = entry.get('go_id', '')
-                    term_name = entry.get('term') or entry.get('name') or curr_id
-                else:
-                    curr_id = entry
-                    term_name = entry
-
-                curr_id = (curr_id or '').strip()
-                term_name = (term_name or '').strip()
-
-                if not curr_id:
-                    continue
-                if not term_name and godag is not None:
-                    curr_term = godag.get(curr_id)
-                    term_name = normalize_term(curr_term.name) if curr_term and curr_term.name else curr_id
-                elif not term_name:
-                    term_name = curr_id
-
-                cached_expansion.append({'go_id': curr_id, 'term': term_name})
-
-            _GO_EXPANSION_CACHE[go_id] = cached_expansion
-
-        # Use cached result
-        for item in _GO_EXPANSION_CACHE[go_id]:
-            if item['go_id'] not in seen:
-                seen.add(item['go_id'])
-                expanded.append(item)
-
-    return expanded
-
-
-def _merge_localization_ancestors(uniprot_terms, go_terms):
-    """Merge UniProt and GO ancestor annotations into one deduplicated list."""
-    merged = []
-    seen = set()
-
-    for term in list(uniprot_terms or []) + list(go_terms or []):
-        normalized = normalize_term(term)
+        uniprot_term = go_dict.get(go_id)
+        if not uniprot_term:
+            continue
+        normalized = normalize_term(uniprot_term)
         if normalized and normalized not in seen:
             seen.add(normalized)
-            merged.append(normalized)
+            translated.append(normalized)
+    return translated
+
+
+def _merge_localization_ancestors(uniprot_terms, translated_go_terms, uniprot_dict):
+    """Merge UniProt and GO-translated-to-UniProt terms, expand through subcell hierarchy, deduplicate."""
+    seen = set()
+    merged = []
+
+    all_terms = list(uniprot_terms or []) + list(translated_go_terms or [])
+    for term in all_terms:
+        normalized = normalize_term(term)
+        if not normalized:
+            continue
+        # Expand through the UniProt subcell hierarchy (includes self + ancestors)
+        candidates = uniprot_dict.get(normalized, [normalized])
+        for t in candidates:
+            t = normalize_term(t)
+            if t and t not in seen:
+                seen.add(t)
+                merged.append(t)
 
     return merged
 
@@ -301,7 +265,7 @@ def _extract_pos(el):
     return None
 
 
-def parse_entry_xml(root, go_dict, uniprot_dict, go_hierarchy, godag):
+def parse_entry_xml(root, go_dict, uniprot_dict):
     """Parse a UniProt XML <entry> element and return a dict of annotation fields."""
     result = {
         'ensembl_id': '',
@@ -413,16 +377,17 @@ def parse_entry_xml(root, go_dict, uniprot_dict, go_hierarchy, godag):
                     })
 
     result['localization_uniprot'] = _expand_subcell_terms(result['localization_uniprot'], uniprot_dict)
-    result['localization_go'] = _expand_go_annotations(result['localization_go'], go_hierarchy, godag)
+    translated_go = _translate_go_to_uniprot(result['localization_go'], go_dict)
     result['localization_ancestors'] = _merge_localization_ancestors(
         result['localization_uniprot'],
-        [item.get('term', '') for item in result['localization_go']],
+        translated_go,
+        uniprot_dict,
     )
 
     return result
 
 
-def setup_uniprot_database(go_dict, uniprot_dict, go_hierarchy, godag, db_file=UNIPROT_DB_FILE):
+def setup_uniprot_database(go_dict, uniprot_dict, db_file=UNIPROT_DB_FILE):
     """Download and index Swiss-Prot + TrEMBL into SQLite."""
     db_exists = os.path.exists(db_file)
     conn = sqlite3.connect(db_file)
@@ -544,7 +509,7 @@ def setup_uniprot_database(go_dict, uniprot_dict, go_hierarchy, godag, db_file=U
                                (acc.tag.endswith('}accession') or acc.tag == 'accession') and acc.text]
 
                         if accs:
-                            parsed = parse_entry_xml(elem, go_dict, uniprot_dict, go_hierarchy, godag)
+                            parsed = parse_entry_xml(elem, go_dict, uniprot_dict)
                             data_blob = pickle.dumps(parsed, protocol=5)
                             organism = parsed.get('organism', '')
                             batch.extend((acc, reviewed_flag, organism, data_blob) for acc in accs)
@@ -826,18 +791,6 @@ def main():
     print(f'  ✓ Subcellular terms: {len(uniprot_dict)}', file=sys.stderr)
     sys.stderr.flush()
 
-    print('  Loading GO hierarchy cache...', file=sys.stderr)
-    sys.stderr.flush()
-    go_hierarchy = load_go_hierarchy()
-    print(f'  ✓ GO hierarchy terms: {len(go_hierarchy)}', file=sys.stderr)
-    sys.stderr.flush()
-
-    print('  Loading GO ontology (may take 10-30 seconds)...', file=sys.stderr)
-    sys.stderr.flush()
-    godag = GODag('go-basic.obo', prt=None)
-    print(f'  ✓ GO terms: {len(godag)}', file=sys.stderr)
-    sys.stderr.flush()
-
     print('  Loading GO→UniProt mappings...', file=sys.stderr)
     sys.stderr.flush()
     go_dict = load_go_dict()
@@ -849,7 +802,7 @@ def main():
 
     print('\nSetting up UniProt database...', file=sys.stderr)
     sys.stderr.flush()
-    setup_uniprot_database(go_dict, uniprot_dict, go_hierarchy, godag)
+    setup_uniprot_database(go_dict, uniprot_dict)
 
     print('Loading results...', file=sys.stderr)
     sys.stderr.flush()

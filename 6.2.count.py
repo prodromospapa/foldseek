@@ -35,6 +35,25 @@ print(f"  {len(dataframe):,} rows loaded. Filtering evalue <= 1e-3...")
 dataframe = dataframe[dataframe["evalue"] <= 1e-3]
 print(f"  {len(dataframe):,} rows after filter.")
 
+def _is_empty(val):
+    if val is None:
+        return True
+    if isinstance(val, float) and pd.isna(val):
+        return True
+    if isinstance(val, (list, tuple, set)):
+        return len(val) == 0
+    if isinstance(val, str):
+        return val.strip() == '' or val.strip() in ('[]', 'nan', 'None')
+    return False
+
+has_ancestors = dataframe["target_localization_ancestors"].apply(lambda x: not _is_empty(x)) \
+    if "target_localization_ancestors" in dataframe.columns else pd.Series(False, index=dataframe.index)
+has_uniprot = dataframe["target_localization_uniprot"].apply(lambda x: not _is_empty(x)) \
+    if "target_localization_uniprot" in dataframe.columns else pd.Series(False, index=dataframe.index)
+
+dataframe = dataframe[has_ancestors | has_uniprot]
+print(f"  {len(dataframe):,} rows after removing entries with no localization (ancestors or uniprot).")
+
 query_col = _select_column(dataframe, ["query_ensembl_id", "query_uniprot_id", "query_gene_name"])
 target_uniprot_col = _select_column(dataframe, ["target_uniprot_id", "target_gene_name"])
 loc_col = _select_column(dataframe, ["target_localization_ancestors", "target_localization_uniprot"])
@@ -107,73 +126,102 @@ per_query_df = per_query_df[[*compartments, 'Total']]
 per_query_df.to_csv('per_query_organelle_counts_proteins.csv')
 print('Saved per_query_organelle_counts_proteins.csv')
 
-# Single pass — deduplicate proteins (by target_uniprot_id) and genes
-# (by target_gene_name + species) simultaneously
-count_tree_unique        = {key: 0 for key in tree.keys()}
-count_tree_species       = defaultdict(lambda: defaultdict(int))
-count_tree_genes         = {key: 0 for key in tree.keys()}
-count_tree_genes_species = defaultdict(lambda: defaultdict(int))
+# Count proteins and genes per organelle for three localization sources independently
+LOC_SOURCES = [
+    ('uniprot',   'target_localization_uniprot'),
+    ('go',        'target_localization_ancestors'),
+    ('combined',  None),  # union of uniprot + go
+]
 
-seen_proteins = set()
-seen_genes    = set()
+for source_name, loc_col_name in LOC_SOURCES:
+    count_tree_unique        = {key: 0 for key in tree.keys()}
+    count_tree_species       = defaultdict(lambda: defaultdict(int))
+    count_tree_genes         = {key: 0 for key in tree.keys()}
+    count_tree_genes_species = defaultdict(lambda: defaultdict(int))
 
-cols = ["target_uniprot_id", "target_gene_name", "target_localization_ancestors"]
-for uniprot_id, gene_name, locations in tqdm.tqdm(
-    dataframe[cols].itertuples(index=False, name=None),
-    total=len(dataframe),
-    desc="Counting proteins and genes per organelle and species",
-    dynamic_ncols=True,
-):
-    organism       = accession_organism.get(uniprot_id, '')
-    is_new_protein = uniprot_id not in seen_proteins
-    gene_key       = (gene_name, organism) if (isinstance(gene_name, str) and gene_name.strip()) else None
-    is_new_gene    = gene_key is not None and gene_key not in seen_genes
+    seen_proteins = set()
+    seen_genes    = set()
 
-    if not is_new_protein and not is_new_gene:
-        continue
+    if source_name == 'combined':
+        uniprot_col = 'target_localization_uniprot'   if 'target_localization_uniprot'   in dataframe.columns else None
+        go_col      = 'target_localization_ancestors' if 'target_localization_ancestors' in dataframe.columns else None
+        iter_cols   = ["target_uniprot_id", "target_gene_name"]
+        if uniprot_col: iter_cols.append(uniprot_col)
+        if go_col:      iter_cols.append(go_col)
+    else:
+        if loc_col_name not in dataframe.columns:
+            print(f"  Skipping '{source_name}': column '{loc_col_name}' not found.")
+            continue
+        iter_cols = ["target_uniprot_id", "target_gene_name", loc_col_name]
 
-    if is_new_protein:
-        seen_proteins.add(uniprot_id)
-    if is_new_gene:
-        seen_genes.add(gene_key)
+    desc = f"Counting proteins/genes per organelle [{source_name}]"
+    for row_tuple in tqdm.tqdm(
+        dataframe[iter_cols].itertuples(index=False, name=None),
+        total=len(dataframe),
+        desc=desc,
+        dynamic_ncols=True,
+    ):
+        if source_name == 'combined':
+            uniprot_id = row_tuple[0]
+            gene_name  = row_tuple[1]
+            locs_uniprot = row_tuple[2] if uniprot_col else []
+            locs_go      = row_tuple[3] if (uniprot_col and go_col) else (row_tuple[2] if go_col else [])
+            locations = list({loc for locs in (locs_uniprot or [], locs_go or []) if isinstance(locs, list) for loc in locs})
+        else:
+            uniprot_id, gene_name, locations = row_tuple
 
-    if not isinstance(locations, list):
-        continue
+        organism       = accession_organism.get(uniprot_id, '')
+        is_new_protein = uniprot_id not in seen_proteins
+        gene_key       = (gene_name, organism) if (isinstance(gene_name, str) and gene_name.strip()) else None
+        is_new_gene    = gene_key is not None and gene_key not in seen_genes
 
-    seen_anc_p = set()
-    seen_anc_g = set()
-    for location in locations:
-        if location and location in tree:
-            for ancestor in tree[location]:
-                if is_new_protein and ancestor not in seen_anc_p:
-                    seen_anc_p.add(ancestor)
-                    count_tree_unique[ancestor] += 1
-                    if organism:
-                        count_tree_species[ancestor][organism] += 1
-                if is_new_gene and ancestor not in seen_anc_g:
-                    seen_anc_g.add(ancestor)
-                    count_tree_genes[ancestor] += 1
-                    if organism:
-                        count_tree_genes_species[ancestor][organism] += 1
+        if not is_new_protein and not is_new_gene:
+            continue
 
-print(f"  {len(seen_proteins):,} unique proteins, {len(seen_genes):,} unique genes.")
+        if is_new_protein:
+            seen_proteins.add(uniprot_id)
+        if is_new_gene:
+            seen_genes.add(gene_key)
 
-# ── Save protein counts ───────────────────────────────────────────────────────
-count_df_species = pd.DataFrame.from_dict(count_tree_species, orient="index")
-count_df_species = count_df_species.reindex(tree.keys(), fill_value=0).fillna(0).astype(int)
-count_df_species.index.name = "Organelle"
-count_df_species["Total"] = pd.Series(count_tree_unique)
-count_df_species = count_df_species[count_df_species["Total"] > 0]
-count_df_species = count_df_species.sort_values(by="Total", ascending=False)
-count_df_species.reset_index().to_csv("organelle_counts_proteins.csv", index=False)
-print("Saved organelle_counts_proteins.csv")
+        if not isinstance(locations, list):
+            continue
 
-# ── Save gene counts ──────────────────────────────────────────────────────────
-count_df_genes = pd.DataFrame.from_dict(count_tree_genes_species, orient="index")
-count_df_genes = count_df_genes.reindex(tree.keys(), fill_value=0).fillna(0).astype(int)
-count_df_genes.index.name = "Organelle"
-count_df_genes["Total"] = pd.Series(count_tree_genes)
-count_df_genes = count_df_genes[count_df_genes["Total"] > 0]
-count_df_genes = count_df_genes.sort_values(by="Total", ascending=False)
-count_df_genes.reset_index().to_csv("organelle_counts_genes.csv", index=False)
-print("Saved organelle_counts_genes.csv")
+        seen_anc_p = set()
+        seen_anc_g = set()
+        for location in locations:
+            if location and location in tree:
+                for ancestor in tree[location]:
+                    if is_new_protein and ancestor not in seen_anc_p:
+                        seen_anc_p.add(ancestor)
+                        count_tree_unique[ancestor] += 1
+                        if organism:
+                            count_tree_species[ancestor][organism] += 1
+                    if is_new_gene and ancestor not in seen_anc_g:
+                        seen_anc_g.add(ancestor)
+                        count_tree_genes[ancestor] += 1
+                        if organism:
+                            count_tree_genes_species[ancestor][organism] += 1
+
+    print(f"  [{source_name}] {len(seen_proteins):,} unique proteins, {len(seen_genes):,} unique genes.")
+
+    # ── Save protein counts ───────────────────────────────────────────────────
+    count_df_species = pd.DataFrame.from_dict(count_tree_species, orient="index")
+    count_df_species = count_df_species.reindex(tree.keys(), fill_value=0).fillna(0).astype(int)
+    count_df_species.index.name = "Organelle"
+    count_df_species["Total"] = pd.Series(count_tree_unique)
+    count_df_species = count_df_species[count_df_species["Total"] > 0]
+    count_df_species = count_df_species.sort_values(by="Total", ascending=False)
+    proteins_csv = f"organelle_counts_proteins_{source_name}.csv"
+    count_df_species.reset_index().to_csv(proteins_csv, index=False)
+    print(f"Saved {proteins_csv}")
+
+    # ── Save gene counts ──────────────────────────────────────────────────────
+    count_df_genes = pd.DataFrame.from_dict(count_tree_genes_species, orient="index")
+    count_df_genes = count_df_genes.reindex(tree.keys(), fill_value=0).fillna(0).astype(int)
+    count_df_genes.index.name = "Organelle"
+    count_df_genes["Total"] = pd.Series(count_tree_genes)
+    count_df_genes = count_df_genes[count_df_genes["Total"] > 0]
+    count_df_genes = count_df_genes.sort_values(by="Total", ascending=False)
+    genes_csv = f"organelle_counts_genes_{source_name}.csv"
+    count_df_genes.reset_index().to_csv(genes_csv, index=False)
+    print(f"Saved {genes_csv}")
