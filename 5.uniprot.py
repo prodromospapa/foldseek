@@ -9,6 +9,7 @@ import runpy
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -16,8 +17,25 @@ from collections import deque
 # third-party
 import pandas as pd
 import wget
-from tqdm import tqdm
 import xml.etree.ElementTree as etree
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
+from rich.table import Table
+from rich.text import Text
+
+_console = Console(stderr=True)
 
 try:
     import psutil
@@ -43,9 +61,9 @@ PRAGMA_JOURNAL_MODE = 'WAL'
 PRAGMA_SYNCHRONOUS  = 'OFF'
 
 UNIPROT_SOURCES = [
-    ('https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.xml.gz',
+    ('https://ftp.ebi.ac.uk/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.xml.gz',
      'uniprot_sprot.xml.gz', 1),  # reviewed (Swiss-Prot)
-    ('https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_trembl.xml.gz',
+    ('https://ftp.ebi.ac.uk/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_trembl.xml.gz',
      'uniprot_trembl.xml.gz', 0),  # unreviewed (TrEMBL)
 ]
 
@@ -55,20 +73,6 @@ def _get_total_memory_gb():
         return psutil.virtual_memory().total / (1024 ** 3)
     return None
 
-
-def _count_xml_entries(gz_file):
-    """Count <entry occurrences in a gzip XML file using zcat|grep -o|wc -l.
-    Returns None if unavailable so tqdm runs without a total."""
-    try:
-        result = subprocess.run(
-            ['bash', '-c', f'zcat {gz_file} | grep -o "<entry " | wc -l'],
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode != 0:
-            return None
-        return int(result.stdout.strip())
-    except Exception:
-        return None
 
 
 def _fetch_online_uniprot_totals():
@@ -168,8 +172,8 @@ def ensure_subcell_assets():
     if not missing:
         return
 
-    print(f"Missing ontology assets: {', '.join(missing)}", file=sys.stderr)
-    print('Running 5.subcell_hierarchy_uniprot.py to fetch/build missing assets...', file=sys.stderr)
+    _console.print(f"[yellow]Missing ontology assets:[/] {', '.join(missing)}")
+    _console.print('Running [bold]5.subcell_hierarchy_uniprot.py[/bold] to build missing assets…')
     script_path = os.path.join(os.path.dirname(__file__), '5.subcell_hierarchy_uniprot.py')
     if not os.path.exists(script_path):
         raise FileNotFoundError(f'Missing builder script: {script_path}')
@@ -304,7 +308,7 @@ def parse_entry_xml(root, go_dict, uniprot_dict):
             if el_parent is not None:
                 parent_tag = el_parent.tag
                 parent_local = parent_tag.split('}')[-1] if '}' in parent_tag else parent_tag
-                if parent_local == 'fullName' or parent_local == 'recommendedName' or parent_local == 'submittedName':
+                if parent_local in ('recommendedName', 'submittedName', 'alternativeName'):
                     result['protein_name'] = el.text.strip()
                     has_protein = True
 
@@ -387,9 +391,31 @@ def parse_entry_xml(root, go_dict, uniprot_dict):
     return result
 
 
+def _is_source_indexed(conn, source_name):
+    """Return True if source_name has been fully indexed in this DB."""
+    conn.execute(
+        'CREATE TABLE IF NOT EXISTS source_progress '
+        '(source_name TEXT PRIMARY KEY, completed_at TEXT NOT NULL)'
+    )
+    conn.commit()
+    row = conn.execute(
+        'SELECT completed_at FROM source_progress WHERE source_name = ?', (source_name,)
+    ).fetchone()
+    return row is not None
+
+
+def _mark_source_indexed(conn, source_name):
+    """Record that source_name has been fully indexed."""
+    import datetime
+    conn.execute(
+        'INSERT OR REPLACE INTO source_progress(source_name, completed_at) VALUES (?, ?)',
+        (source_name, datetime.datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+
+
 def setup_uniprot_database(go_dict, uniprot_dict, db_file=UNIPROT_DB_FILE):
-    """Download and index Swiss-Prot + TrEMBL into SQLite."""
-    db_exists = os.path.exists(db_file)
+    """Stream and index Swiss-Prot + TrEMBL into SQLite."""
     conn = sqlite3.connect(db_file)
     conn.execute(f'PRAGMA journal_mode = {PRAGMA_JOURNAL_MODE}')
     conn.execute(f'PRAGMA synchronous = {PRAGMA_SYNCHRONOUS}')
@@ -397,171 +423,117 @@ def setup_uniprot_database(go_dict, uniprot_dict, db_file=UNIPROT_DB_FILE):
     conn.execute('PRAGMA temp_store = MEMORY')
     conn.execute('CREATE TABLE IF NOT EXISTS entries '
                  '(accession TEXT PRIMARY KEY, reviewed INTEGER NOT NULL, organism TEXT NOT NULL, data BLOB NOT NULL)')
-    conn.execute('CREATE TABLE IF NOT EXISTS source_index_log '
-                 '(source TEXT PRIMARY KEY, completed INTEGER NOT NULL DEFAULT 0, indexed_entries INTEGER NOT NULL DEFAULT 0)')
     conn.commit()
 
-    row_count = conn.execute('SELECT COUNT(*) FROM entries').fetchone()[0]
-    if db_exists:
-        if row_count > 0:
-            print(f'Using existing UniProt database: {db_file} ({row_count:,} rows)', file=sys.stderr)
-        else:
-            print(f'Existing database found but empty ({db_file}); rebuilding index...', file=sys.stderr)
-    else:
-        print(f'No existing UniProt database found at {db_file}; building index...', file=sys.stderr)
-
-    # Backfill source-level progress for legacy DBs that predate source_index_log.
-    existing_log_rows = conn.execute('SELECT COUNT(*) FROM source_index_log').fetchone()[0]
-    if existing_log_rows == 0 and row_count > 0:
-        reviewed_count = conn.execute('SELECT COUNT(*) FROM entries WHERE reviewed = 1').fetchone()[0]
-        unreviewed_count = conn.execute('SELECT COUNT(*) FROM entries WHERE reviewed = 0').fetchone()[0]
-
-        if reviewed_count > 0:
-            conn.execute(
-                'INSERT OR REPLACE INTO source_index_log(source, completed, indexed_entries) VALUES (?,?,?)',
-                ('uniprot_sprot.xml.gz', 1, reviewed_count),
-            )
-        if unreviewed_count > 0:
-            conn.execute(
-                'INSERT OR REPLACE INTO source_index_log(source, completed, indexed_entries) VALUES (?,?,?)',
-                ('uniprot_trembl.xml.gz', 1, unreviewed_count),
-            )
-        conn.commit()
-
-        if reviewed_count > 0 or unreviewed_count > 0:
-            print('Bootstrapped source_index_log from existing reviewed/unreviewed rows.', file=sys.stderr)
-
-    source_status = {}
-    for _, xml_file, _ in UNIPROT_SOURCES:
-        row = conn.execute(
-            'SELECT completed FROM source_index_log WHERE source = ?', (xml_file,)
-        ).fetchone()
-        source_status[xml_file] = bool(row and row[0])
-
-    if all(source_status.values()):
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_accession ON entries(accession)')
-        conn.commit()
-        conn.close()
-        print('Swiss-Prot and TrEMBL already indexed; skipping UniProt indexing.', file=sys.stderr)
-        return
+    _console.print(f'[bold cyan]Building UniProt database:[/] [green]{db_file}[/]')
 
     upsert_sql = (
-        'INSERT INTO entries(accession, reviewed, organism, data) VALUES (?,?,?,?) '
-        'ON CONFLICT(accession) DO UPDATE SET '
-        'reviewed = CASE WHEN excluded.reviewed > entries.reviewed THEN excluded.reviewed ELSE entries.reviewed END, '
-        'organism = CASE WHEN excluded.reviewed > entries.reviewed THEN excluded.organism ELSE entries.organism END, '
-        'data = CASE WHEN excluded.reviewed > entries.reviewed THEN excluded.data ELSE entries.data END'
+        'INSERT OR REPLACE INTO entries(accession, reviewed, organism, data) VALUES (?,?,?,?)'
     )
 
+    all_done = all(_is_source_indexed(conn, 'Swiss-Prot' if f == 1 else 'TrEMBL') for _, _, f in UNIPROT_SOURCES)
+    if all_done:
+        _console.print('[bold green]✓[/] All sources already indexed — skipping setup_uniprot_database.')
+        conn.close()
+        return
+
+    _console.print('[dim]Fetching online UniProt entry counts…[/]')
+    online_totals = _fetch_online_uniprot_totals()
+
     for url, xml_file, reviewed_flag in UNIPROT_SOURCES:
-        if source_status.get(xml_file, False):
-            print(f'\nSkipping {xml_file}: already indexed (source_index_log).', file=sys.stderr)
+        source_name  = 'Swiss-Prot' if reviewed_flag == 1 else 'TrEMBL'
+        source_color = 'yellow' if reviewed_flag == 1 else 'cyan'
+        total_entries = online_totals.get(reviewed_flag)
+
+        if _is_source_indexed(conn, source_name):
+            _console.print(f'  [bold green]✓[/] [{source_color}]{source_name}[/] already indexed — skipping.')
             continue
 
-        use_local = os.path.exists(xml_file)
-        online_totals = _fetch_online_uniprot_totals()
-        total_entries = online_totals.get(reviewed_flag)
-        source_name = 'Swiss-Prot' if reviewed_flag == 1 else 'TrEMBL'
-        if total_entries is not None:
-            print(f'\nRefreshed online total for {source_name}: {total_entries:,} entries', file=sys.stderr)
-        else:
-            print(f'\nOnline total unavailable for {source_name}; falling back to local counting if possible.', file=sys.stderr)
+        def _open_source(url=url, local_path=xml_file):
+            if os.path.exists(local_path):
+                size_gb = os.path.getsize(local_path) / (1024 ** 3)
+                _console.print(f'  Using local file: [green]{local_path}[/] ({size_gb:.1f} GB)')
+                return gzip.open(local_path, 'rt', encoding='utf-8', errors='ignore')
 
-        if use_local:
-            if total_entries is not None:
-                print(f'\nUsing online total for {xml_file}: {total_entries:,} entries', file=sys.stderr)
-            else:
-                print(f'\nCounting entries in {xml_file}...', file=sys.stderr)
-                sys.stderr.flush()
-                total_entries = _count_xml_entries(xml_file)
-                if total_entries is not None:
-                    print(f'  {total_entries:,} entries found', file=sys.stderr)
-                else:
-                    print(f'  Count unavailable, progress bar will show absolute numbers', file=sys.stderr)
-        else:
-            print(f'\nStreaming {xml_file} from {url} (no local copy to save disk space)...', file=sys.stderr)
-            if total_entries is not None:
-                print(f'  Online total: {total_entries:,} entries', file=sys.stderr)
-            else:
-                print('  Online total unavailable, progress bar will show absolute numbers', file=sys.stderr)
-
-        print(f'Indexing {xml_file}...', file=sys.stderr)
-        sys.stderr.flush()
-
-        def _open_source():
-            if use_local:
-                return gzip.open(xml_file, 'rt', encoding='utf-8', errors='ignore')
-            else:
-                response = urllib.request.urlopen(url)
-                return gzip.open(response, 'rt', encoding='utf-8', errors='ignore')
+            # Stream via curl stdout → gzip → iterparse (no disk, starts immediately).
+            _console.print(f'  Streaming [bold]{source_name}[/] directly from UniProt FTP…')
+            proc = subprocess.Popen(
+                ['curl', '-L', '--retry', '10', '--retry-delay', '5',
+                 '--retry-max-time', '3600', '--silent', '--show-error', url],
+                stdout=subprocess.PIPE, stderr=sys.stderr,
+            )
+            return gzip.open(proc.stdout, 'rt', encoding='utf-8', errors='ignore')
 
         n, batch = 0, []
-        source_complete = True
+
+        src_file = _open_source()
+
+        index_progress = Progress(
+            SpinnerColumn(),
+            TextColumn(f'  [{source_color}][bold]{source_name}[/bold][/{source_color}]'),
+            BarColumn(bar_width=45),
+            MofNCompleteColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TextColumn('[dim]eta[/dim]'),
+            TimeRemainingColumn(),
+            TextColumn('[dim]{task.fields[ram]}[/dim]'),
+            console=_console,
+            transient=False,
+        )
+        task_id = index_progress.add_task(source_name, total=total_entries, ram='decompressing…')
+
         try:
-            with _open_source() as f:
-                pbar = tqdm(total=total_entries, unit='entry', desc=xml_file, file=sys.stderr)
-                for event, elem in etree.iterparse(f, events=('end',)):
-                    if not (elem.tag.endswith('}entry') or elem.tag == 'entry'):
-                        continue
+            with index_progress:
+                with src_file as f:
+                    for event, elem in etree.iterparse(f, events=('end',)):
+                        if not (elem.tag.endswith('}entry') or elem.tag == 'entry'):
+                            continue
 
-                    try:
-                        accs = [acc.text for acc in elem.iter() if
-                               (acc.tag.endswith('}accession') or acc.tag == 'accession') and acc.text]
+                        try:
+                            accs = [acc.text for acc in elem.iter() if
+                                   (acc.tag.endswith('}accession') or acc.tag == 'accession') and acc.text]
 
-                        if accs:
-                            parsed = parse_entry_xml(elem, go_dict, uniprot_dict)
-                            data_blob = pickle.dumps(parsed, protocol=5)
-                            organism = parsed.get('organism', '')
-                            batch.extend((acc, reviewed_flag, organism, data_blob) for acc in accs)
-                            n += 1
-                            pbar.update(1)
+                            if accs:
+                                parsed = parse_entry_xml(elem, go_dict, uniprot_dict)
+                                data_blob = pickle.dumps(parsed, protocol=5)
+                                organism = parsed.get('organism', '')
+                                batch.extend((acc, reviewed_flag, organism, data_blob) for acc in accs)
+                                n += 1
+                                if n == 1:
+                                    index_progress.update(task_id, ram='RAM: —')
+                                index_progress.advance(task_id)
 
-                            if n % 10000 == 0:
-                                mem_gb = ram_used_gb()
-                                pbar.set_postfix_str(f'{mem_gb:.1f}/{_TOTAL_MEM_GB:.0f}GB RAM')
-                                check_memory_safety('indexing')
-                                if mem_gb is not None and mem_gb >= FLUSH_RAM_LIMIT_GB:
-                                    conn.executemany(upsert_sql, batch)
-                                    conn.commit()
-                                    batch = []
-                                    gc.collect()
-                    except Exception:
-                        pass
-                    finally:
-                        elem.clear()
-                pbar.close()
-
-        except EOFError:
-            print(f'\nGzip truncated for {xml_file}; partial data indexed.', file=sys.stderr)
-            source_complete = False
+                                if n % 10000 == 0:
+                                    mem_gb = ram_used_gb()
+                                    ram_str = (f'RAM: {mem_gb:.1f}/{_TOTAL_MEM_GB:.0f} GB'
+                                               if mem_gb else 'RAM: —')
+                                    index_progress.update(task_id, ram=ram_str)
+                                    check_memory_safety('indexing')
+                                    if mem_gb is not None and mem_gb >= FLUSH_RAM_LIMIT_GB:
+                                        conn.executemany(upsert_sql, batch)
+                                        conn.commit()
+                                        batch = []
+                                        gc.collect()
+                        except Exception:
+                            pass
+                        finally:
+                            elem.clear()
         finally:
             safe_collect()
 
         if batch:
             conn.executemany(upsert_sql, batch)
             conn.commit()
-        print(f'\n  ✓ Done: {n:,} entries from {xml_file}', file=sys.stderr)
-        sys.stderr.flush()
+        _mark_source_indexed(conn, source_name)
+        _console.print(f'  [bold green]✓[/] [{source_color}]{source_name}[/]: [bold]{n:,}[/] entries indexed.')
         safe_collect()
-
-        if source_complete:
-            conn.execute(
-                'INSERT OR REPLACE INTO source_index_log(source, completed, indexed_entries) VALUES (?,?,?)',
-                (xml_file, 1, n),
-            )
-            conn.commit()
-        else:
-            print(f'  Not marking {xml_file} complete due to truncated stream; it will resume on rerun.', file=sys.stderr)
-
-        if use_local and os.path.exists(xml_file):
-            os.remove(xml_file)
-            print(f'  Deleted {xml_file}', file=sys.stderr)
 
     conn.execute('CREATE INDEX IF NOT EXISTS idx_accession ON entries(accession)')
     conn.commit()
 
     conn.close()
-    print('UniProt database created.', file=sys.stderr)
+    _console.print('[bold green]✓[/] UniProt database ready.')
 
 
 def ram_used_gb():
@@ -649,11 +621,11 @@ def load_results():
             df = pd.read_pickle(ANNOTATED_FILE)
             base_df = pd.read_pickle(RESULTS_FILE)
             if 'target_reviewed' not in df.columns or len(df) != len(base_df):
-                print('Detected legacy results file; rebuilding from base results.', file=sys.stderr)
+                _console.print('[yellow]Detected legacy results file; rebuilding from base results.[/]')
                 df = base_df.copy()
             del base_df
         except (EOFError, pickle.UnpicklingError):
-            print('Corrupted annotated results file; rebuilding.', file=sys.stderr)
+            _console.print('[red]Corrupted annotated results file; rebuilding.[/]')
             df = pd.read_pickle(RESULTS_FILE)
     else:
         df = pd.read_pickle(RESULTS_FILE)
@@ -701,12 +673,12 @@ def ensure_columns(df):
 def load_progress():
     """Return the list of already-processed UniProt IDs from checkpoint file."""
     if not os.path.exists(PROGRESS_FILE):
-        print(f'No progress checkpoint found ({PROGRESS_FILE}); starting from 0 processed IDs.', file=sys.stderr)
+        _console.print(f'[dim]No progress checkpoint found ({PROGRESS_FILE}); starting fresh.[/dim]')
         return []
     try:
         return pd.read_pickle(PROGRESS_FILE)['uniprot_id'].tolist()
     except (EOFError, pickle.UnpicklingError):
-        print('Corrupted progress file; restarting progress tracking.', file=sys.stderr)
+        _console.print('[red]Corrupted progress file; restarting progress tracking.[/]')
         return []
 
 
@@ -782,140 +754,162 @@ def annotate_id(df, uniprot_id, info, query_map, target_map, dimer_map):
 
 
 def main():
-    print('Loading ontology resources...', file=sys.stderr)
-    sys.stderr.flush()
+    from rich.rule import Rule
 
+    _console.print(Rule('[bold blue]UniProt Annotation Pipeline[/bold blue]'))
+
+    # ── Ontology assets ────────────────────────────────────────────────────────
+    _console.print('\n[bold]Step 1/3[/bold]  Loading ontology resources…')
     ensure_subcell_assets()
 
     uniprot_dict = pd.read_pickle('subcell_hierarchy.pkl')
-    print(f'  ✓ Subcellular terms: {len(uniprot_dict)}', file=sys.stderr)
-    sys.stderr.flush()
+    _console.print(f'  [green]✓[/] Subcellular terms: [bold]{len(uniprot_dict):,}[/]')
 
-    print('  Loading GO→UniProt mappings...', file=sys.stderr)
-    sys.stderr.flush()
     go_dict = load_go_dict()
-    print(f'  ✓ GO→UniProt mappings: {len(go_dict)}', file=sys.stderr)
-    sys.stderr.flush()
+    _console.print(f'  [green]✓[/] GO→UniProt mappings: [bold]{len(go_dict):,}[/]')
 
-    print(f'\nSystem: {_TOTAL_MEM_GB:.1f}GB RAM | flush limit {FLUSH_RAM_PCT*100:.0f}% ({FLUSH_RAM_LIMIT_GB:.1f}GB) | hard limit {MEMORY_HARD_LIMIT_PCT*100:.0f}% ({MEMORY_HARD_LIMIT_GB:.1f}GB)', file=sys.stderr)
-    sys.stderr.flush()
+    mem_info = (
+        f'[bold]{_TOTAL_MEM_GB:.1f} GB[/] RAM  '
+        f'flush @ [yellow]{FLUSH_RAM_PCT*100:.0f}%[/] ({FLUSH_RAM_LIMIT_GB:.1f} GB)  '
+        f'hard limit @ [red]{MEMORY_HARD_LIMIT_PCT*100:.0f}%[/] ({MEMORY_HARD_LIMIT_GB:.1f} GB)'
+    )
+    _console.print(f'\n  [dim]System:[/dim] {mem_info}')
 
-    print('\nSetting up UniProt database...', file=sys.stderr)
-    sys.stderr.flush()
+    # ── Database setup ─────────────────────────────────────────────────────────
+    _console.print(f'\n[bold]Step 2/3[/bold]  Building UniProt SQLite database…')
     setup_uniprot_database(go_dict, uniprot_dict)
 
-    print('Loading results...', file=sys.stderr)
-    sys.stderr.flush()
+    # ── Annotation ─────────────────────────────────────────────────────────────
+    _console.print(f'\n[bold]Step 3/3[/bold]  Annotating FoldSeek results…')
     df = load_results()
-    print(f'  ✓ {len(df)} result rows', file=sys.stderr)
+    _console.print(f'  [green]✓[/] Loaded [bold]{len(df):,}[/] result rows')
 
     if ensure_columns(df):
         atomic_pickle_dump(df, ANNOTATED_FILE)
-        print('  ✓ Added missing columns', file=sys.stderr)
-    sys.stderr.flush()
+        _console.print('  [green]✓[/] Added missing annotation columns')
 
     done_ids = set(_normalize_uniprot_ids(load_progress()))
     all_ids = set(_normalize_uniprot_ids(
-        df['target_uniprot_id'].tolist() + df['query_uniprot_id'].tolist()
+        df['target_uniprot_id'].tolist()
+        + df['query_uniprot_id'].tolist()
+        + df['target_dimer_uniprot_id'].tolist()
     ))
     pending_ids = all_ids - done_ids
-    print(f'\nTotal IDs: {len(all_ids):,} | done: {len(done_ids):,} | pending: {len(pending_ids):,}', file=sys.stderr)
+
+    _console.print(
+        f'  Total IDs: [bold]{len(all_ids):,}[/]  '
+        f'[green]done: {len(done_ids):,}[/]  '
+        f'[yellow]pending: {len(pending_ids):,}[/]'
+    )
 
     query_map  = df.groupby('query_uniprot_id').groups
     target_map = df.groupby('target_uniprot_id').groups
     dimer_map  = df.groupby('target_dimer_uniprot_id').groups
-    print(f'Annotating {len(pending_ids):,} entries...\n', file=sys.stderr)
-    sys.stderr.flush()
 
-    pending_list = sorted(pending_ids)
-    batch_num = 0
+    pending_list  = sorted(pending_ids)
+    batch_num     = 0
     total_pending = len(pending_list)
     attempted_total = 0
-    found_total = 0
-    pct_bar_format = '{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
-    overall_pbar = tqdm(
-        total=total_pending,
-        desc='Overall annotation',
-        unit='id',
-        file=sys.stderr,
-        bar_format=pct_bar_format,
+    found_total     = 0
+
+    overall_progress = Progress(
+        SpinnerColumn(),
+        TextColumn('[bold magenta]Overall[/bold magenta]'),
+        BarColumn(bar_width=45),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        TextColumn('[dim]eta[/dim]'),
+        TimeRemainingColumn(),
+        TextColumn('[dim]{task.fields[status]}[/dim]'),
+        console=_console,
+        transient=False,
+    )
+    batch_progress = Progress(
+        SpinnerColumn(),
+        TextColumn('  [cyan]{task.description}[/cyan]'),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        TextColumn('[dim]{task.fields[ram]}[/dim]'),
+        console=_console,
+        transient=True,
     )
 
-    for cache, remaining in fetch_entries_batch(pending_list):
-        check_memory_safety(f'batch {batch_num}')
-        batch_num += 1
+    overall_task = overall_progress.add_task(
+        'annotation', total=total_pending, status='starting…'
+    )
 
-        batch_start = attempted_total
-        batch_attempted = total_pending - len(remaining) - attempted_total
-        if batch_attempted < 0:
-            batch_attempted = 0
-        attempted_total += batch_attempted
-        batch_end = attempted_total
-        attempted_ids = pending_list[batch_start:batch_end]
+    _console.print()
+    with overall_progress:
+        for cache, remaining in fetch_entries_batch(pending_list):
+            check_memory_safety(f'batch {batch_num}')
+            batch_num += 1
 
-        mem_gb = ram_used_gb() or 0
-        batch_ids = list(cache.keys())
-        found_in_batch = len(batch_ids)
-        missing_in_batch = max(0, batch_attempted - found_in_batch)
-        found_total += found_in_batch
-        print(
-            f'Batch {batch_num}: found {found_in_batch:,}/{batch_attempted:,} IDs '
-            f'(missing {missing_in_batch:,}) [{mem_gb:.1f}/{_TOTAL_MEM_GB:.0f}GB RAM]',
-            file=sys.stderr,
-        )
-        sys.stderr.flush()
+            batch_start = attempted_total
+            batch_attempted = total_pending - len(remaining) - attempted_total
+            if batch_attempted < 0:
+                batch_attempted = 0
+            attempted_total += batch_attempted
+            attempted_ids = pending_list[batch_start:attempted_total]
 
-        pbar = tqdm(
-            attempted_ids,
-            total=batch_attempted,
-            desc=f'Batch {batch_num}',
-            leave=False,
-            unit='id',
-            file=sys.stderr,
-            bar_format=pct_bar_format,
-        )
-        for i, uniprot_id in enumerate(pbar, 1):
-            info = cache.get(uniprot_id)
-            if info:
-                annotate_id(df, uniprot_id, info, query_map, target_map, dimer_map)
+            mem_gb = ram_used_gb() or 0
+            found_in_batch = len(cache)
+            missing_in_batch = max(0, batch_attempted - found_in_batch)
+            found_total += found_in_batch
 
-            overall_pbar.update(1)
-            if i % 1000 == 0:
-                mem_gb = ram_used_gb() or 0
-                pbar.set_postfix_str(f'{mem_gb:.1f}/{BATCH_RAM_LIMIT_GB:.1f}GB RAM limit')
-                overall_pbar.set_postfix_str(
-                    f'found {found_total:,} | missing {max(0, (batch_start + i) - found_total):,}'
-                )
+            _console.print(
+                f'  [bold]Batch {batch_num}[/]:  '
+                f'[green]found {found_in_batch:,}[/] / {batch_attempted:,}  '
+                f'[red]missing {missing_in_batch:,}[/]  '
+                f'[dim]RAM {mem_gb:.1f}/{_TOTAL_MEM_GB:.0f} GB[/]'
+            )
 
-        overall_pbar.set_postfix_str(
-            f'found {found_total:,} | missing {max(0, attempted_total - found_total):,}'
-        )
+            batch_task = batch_progress.add_task(
+                f'Batch {batch_num}', total=batch_attempted, ram='RAM: —'
+            )
 
-        # Mark all attempted IDs as processed, including IDs not found in UniProt DB.
-        if attempted_ids:
-            done_ids.update(attempted_ids)
+            with batch_progress:
+                for i, uniprot_id in enumerate(attempted_ids, 1):
+                    info = cache.get(uniprot_id)
+                    if info:
+                        annotate_id(df, uniprot_id, info, query_map, target_map, dimer_map)
 
-        # Checkpoint after each batch (batch size is already RAM-limited)
-        atomic_pickle_dump(df, ANNOTATED_FILE)
-        atomic_pickle_dump(pd.DataFrame({'uniprot_id': sorted(done_ids)}), PROGRESS_FILE)
+                    batch_progress.advance(batch_task)
+                    overall_progress.advance(overall_task)
 
-        del cache
-        gc.collect()
+                    if i % 1000 == 0:
+                        mem_gb = ram_used_gb() or 0
+                        batch_progress.update(
+                            batch_task,
+                            ram=f'RAM {mem_gb:.1f}/{BATCH_RAM_LIMIT_GB:.1f} GB',
+                        )
+                        overall_progress.update(
+                            overall_task,
+                            status=f'found {found_total:,} | missing {max(0, attempted_total - found_total):,}',
+                        )
 
-    overall_pbar.close()
+            overall_progress.update(
+                overall_task,
+                status=f'found {found_total:,} | missing {max(0, attempted_total - found_total):,}',
+            )
 
-    # Final save
-    print('\nSaving final results...', file=sys.stderr)
+            if attempted_ids:
+                done_ids.update(attempted_ids)
+
+            atomic_pickle_dump(df, ANNOTATED_FILE)
+            atomic_pickle_dump(pd.DataFrame({'uniprot_id': sorted(done_ids)}), PROGRESS_FILE)
+
+            del cache
+            gc.collect()
+
+    # ── Final save ─────────────────────────────────────────────────────────────
+    _console.print('\n[dim]Saving final results…[/dim]')
     atomic_pickle_dump(df, ANNOTATED_FILE)
     atomic_pickle_dump(pd.DataFrame({'uniprot_id': sorted(done_ids)}), PROGRESS_FILE)
-    print(f'  ✓ {ANNOTATED_FILE}', file=sys.stderr)
-
-    # Cleanup
-    for _, xml_file, _ in UNIPROT_SOURCES:
-        if os.path.exists(xml_file):
-            os.remove(xml_file)
-
-    print('✓ Complete!', file=sys.stderr)
+    _console.print(f'  [green]✓[/] [bold]{ANNOTATED_FILE}[/]')
+    _console.print(Rule('[bold green]Complete![/bold green]'))
 
 
 if __name__ == '__main__':
