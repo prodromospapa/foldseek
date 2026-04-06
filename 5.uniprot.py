@@ -1,6 +1,7 @@
 # stdlib
 import gc
 import gzip
+import io
 import json
 import os
 import pickle
@@ -17,21 +18,54 @@ from collections import deque
 # third-party
 import pandas as pd
 import wget
-import xml.etree.ElementTree as etree
+try:
+    from lxml import etree
+    _XMLSyntaxError = etree.XMLSyntaxError
+    _USING_LXML = True
+except ImportError:
+    import xml.etree.ElementTree as etree
+    _XMLSyntaxError = etree.ParseError
+    _USING_LXML = False
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
-    MofNCompleteColumn,
+    MofNCompleteColumn,  # kept for potential use
     Progress,
+    ProgressColumn,
     SpinnerColumn,
+    Task,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
-    TransferSpeedColumn,
+
 )
+
+class MofNCommaColumn(ProgressColumn):
+    """M of N progress column with comma-separated thousands."""
+
+    def render(self, task: Task) -> 'Text':
+        completed = int(task.completed)
+        total = int(task.total) if task.total is not None else None
+        if total is not None:
+            return Text(f'{completed:,}/{total:,}', style='progress.download')
+        return Text(f'{completed:,}', style='progress.download')
+
+
+class EntriesPerSecondColumn(ProgressColumn):
+    """Shows processing speed in entries/s."""
+
+    def render(self, task: Task) -> 'Text':
+        speed = task.speed
+        if speed is None:
+            return Text('— entries/s', style='progress.data.speed')
+        if speed >= 1000:
+            return Text(f'{speed/1000:.1f}k entries/s', style='progress.data.speed')
+        return Text(f'{speed:.1f} entries/s', style='progress.data.speed')
+
+
 from rich.table import Table
 from rich.text import Text
 
@@ -124,18 +158,19 @@ BATCH_RAM_LIMIT_GB   = FLUSH_RAM_LIMIT_GB
 
 
 def get_memory_usage_gb():
-    """Get total system RAM currently in use, in GB."""
+    """Get current process RSS memory usage in GB."""
     if HAS_PSUTIL and psutil is not None:
-        return psutil.virtual_memory().used / (1024 ** 3)
+        return psutil.Process().memory_info().rss / (1024 ** 3)
 
     try:
-        with open('/proc/meminfo', 'r', encoding='utf-8') as f:
-            meminfo = dict(line.split(':', 1) for line in f)
-        total_kb = int(meminfo['MemTotal'].split()[0])
-        avail_kb = int(meminfo['MemAvailable'].split()[0])
-        return (total_kb - avail_kb) / (1024 ** 2)
+        with open('/proc/self/status', 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    rss_kb = int(line.split()[1])
+                    return rss_kb / (1024 ** 2)
     except (OSError, KeyError, ValueError):
-        return None
+        pass
+    return None
 
 
 def check_memory_safety(check_name='operation'):
@@ -197,10 +232,10 @@ def _expand_subcell_terms(locations, uniprot_dict):
             continue
         if loc_l in uniprot_dict:
             for anc in uniprot_dict[loc_l]:
-                anc_l = anc.lower()
-                if anc_l not in seen:
-                    seen.add(anc_l)
-                    expanded.append(anc_l)
+                # uniprot_dict values are pre-normalized (already lowercase)
+                if anc not in seen:
+                    seen.add(anc)
+                    expanded.append(anc)
         elif loc_l not in seen:
             seen.add(loc_l)
             expanded.append(loc_l)
@@ -235,10 +270,10 @@ def _merge_localization_ancestors(uniprot_terms, translated_go_terms, uniprot_di
         normalized = normalize_term(term)
         if not normalized:
             continue
-        # Expand through the UniProt subcell hierarchy (includes self + ancestors)
+        # Expand through the UniProt subcell hierarchy (includes self + ancestors).
+        # Values in uniprot_dict are pre-normalized, so no need to normalize again.
         candidates = uniprot_dict.get(normalized, [normalized])
         for t in candidates:
-            t = normalize_term(t)
             if t and t not in seen:
                 seen.add(t)
                 merged.append(t)
@@ -269,6 +304,18 @@ def _extract_pos(el):
     return None
 
 
+_local_cache: dict[str, str] = {}
+
+def _local(tag):
+    """Return the local part of a namespace-qualified XML tag."""
+    try:
+        return _local_cache[tag]
+    except KeyError:
+        result = tag.split('}')[-1] if '}' in tag else tag
+        _local_cache[tag] = result
+        return result
+
+
 def parse_entry_xml(root, go_dict, uniprot_dict):
     """Parse a UniProt XML <entry> element and return a dict of annotation fields."""
     result = {
@@ -284,60 +331,49 @@ def parse_entry_xml(root, go_dict, uniprot_dict):
 
     seen_go_terms = set()
     domain_types = {'domain', 'repeat', 'motif', 'zinc finger', 'region'}
+    protein_name_parents = {'recommendedName', 'submittedName', 'alternativeName'}
 
-    # Build parent map once for O(1) lookups (Issue 1.1 optimization)
-    parent_map = {}
-    for parent in root.iter():
-        for child in parent:
-            parent_map[id(child)] = parent
+    # Iterate direct children of root to avoid building a parent map.
+    # UniProt XML structure is well-defined: top-level children are protein,
+    # gene, organism, dbReference, comment, feature, etc.
+    for child in root:
+        child_local = _local(child.tag)
 
-    # Pre-index elements by tag name for fast lookup (Issue 1.2 optimization)
-    has_protein = has_gene = has_ensembl = has_organism = False
-
-    # Single pass through element tree with parent map
-    for el in root.iter():
-        el_id = id(el)
-        el_parent = parent_map.get(el_id)
-
-        # Extract tag name once (Issue 1.3 optimization - cache tag names)
-        tag = el.tag
-        tag_local = tag.split('}')[-1] if '}' in tag else tag
-
-        # Protein name
-        if tag_local == 'fullName' and not has_protein and el.text:
-            if el_parent is not None:
-                parent_tag = el_parent.tag
-                parent_local = parent_tag.split('}')[-1] if '}' in parent_tag else parent_tag
-                if parent_local in ('recommendedName', 'submittedName', 'alternativeName'):
-                    result['protein_name'] = el.text.strip()
-                    has_protein = True
+        # Protein name — walk recommendedName / submittedName / alternativeName
+        if child_local == 'protein' and not result['protein_name']:
+            for name_el in child:
+                if _local(name_el.tag) in protein_name_parents:
+                    fn = next((c for c in name_el if _local(c.tag) == 'fullName'), None)
+                    if fn is not None and fn.text:
+                        result['protein_name'] = fn.text.strip()
+                        break
 
         # Gene name
-        elif tag_local == 'name' and el.text:
-            if el_parent is not None:
-                parent_tag = el_parent.tag
-                parent_local = parent_tag.split('}')[-1] if '}' in parent_tag else parent_tag
-                if parent_local == 'gene' and not has_gene:
-                    result['gene_name'] = el.text.strip()
-                    has_gene = True
-                elif parent_local == 'organism' and not has_organism and el.get('type') == 'scientific':
-                    result['organism'] = el.text.strip().lower()
-                    has_organism = True
+        elif child_local == 'gene' and not result['gene_name']:
+            for name_el in child:
+                if _local(name_el.tag) == 'name' and name_el.text:
+                    result['gene_name'] = name_el.text.strip()
+                    break
 
-        # Database references
-        elif tag_local == 'dbReference':
-            dbtype = el.get('type')
-            dbid = el.get('id')
+        # Organism
+        elif child_local == 'organism' and not result['organism']:
+            for name_el in child:
+                if _local(name_el.tag) == 'name' and name_el.get('type') == 'scientific' and name_el.text:
+                    result['organism'] = name_el.text.strip().lower()
+                    break
+
+        # Database references (Ensembl, PANTHER, GO)
+        elif child_local == 'dbReference':
+            dbtype = child.get('type')
+            dbid = child.get('id')
             if dbtype and dbid:
-                if dbtype == 'Ensembl' and not has_ensembl:
+                if dbtype == 'Ensembl' and not result['ensembl_id']:
                     result['ensembl_id'] = dbid.split('.')[0]
-                    has_ensembl = True
                 elif dbtype == 'PANTHER':
                     result['panthr_id'].append(dbid)
                 elif dbtype == 'GO':
-                    for prop in el:
-                        prop_tag = prop.tag.split('}')[-1] if '}' in prop.tag else prop.tag
-                        if prop_tag == 'property':
+                    for prop in child:
+                        if _local(prop.tag) == 'property':
                             val = prop.get('value') or (prop.text.strip() if prop.text else '')
                             if val.startswith('C:'):
                                 term = val[2:]
@@ -345,37 +381,38 @@ def parse_entry_xml(root, go_dict, uniprot_dict):
                                     seen_go_terms.add(term)
                                     result['localization_go'].append({'go_id': dbid, 'term': term})
 
-        # Subcellular locations
-        elif tag_local == 'location' and el_parent is not None:
-            parent_tag = el_parent.tag
-            parent_local = parent_tag.split('}')[-1] if '}' in parent_tag else parent_tag
-            if parent_local in ('subcellularLocation', 'subcellularLocations'):
-                v = next((c for c in el if (c.tag.split('}')[-1] if '}' in c.tag else c.tag) == 'value'), None)
-                val = (v.text.strip() if v is not None and v.text else None) or \
-                      (el.text.strip() if el.text else None)
-                if val and val not in result['localization_uniprot']:
-                    result['localization_uniprot'].append(val)
+        # Subcellular location comments
+        elif child_local == 'comment' and child.get('type') == 'subcellular location':
+            for subcell in child:
+                if _local(subcell.tag) not in ('subcellularLocation', 'subcellularLocations'):
+                    continue
+                for loc in subcell:
+                    if _local(loc.tag) == 'location':
+                        v = next((c for c in loc if _local(c.tag) == 'value'), None)
+                        val = (v.text.strip() if v is not None and v.text else None) or \
+                              (loc.text.strip() if loc.text else None)
+                        if val and val not in result['localization_uniprot']:
+                            result['localization_uniprot'].append(val)
 
         # Features (domains, etc.)
-        elif tag_local == 'feature':
-            ftype = el.get('type', '').lower()
+        elif child_local == 'feature':
+            ftype = child.get('type', '').lower()
             if ftype not in domain_types:
                 continue
 
-            loc = next((c for c in el if (c.tag.split('}')[-1] if '}' in c.tag else c.tag) == 'location'), None)
+            loc = next((c for c in child if _local(c.tag) == 'location'), None)
             if loc is not None:
-                # Extract all positions at once (Issue 7.1 optimization)
-                begin = _extract_pos(next((c for c in loc if (c.tag.split('}')[-1] if '}' in c.tag else c.tag) == 'begin'), None))
-                end = _extract_pos(next((c for c in loc if (c.tag.split('}')[-1] if '}' in c.tag else c.tag) == 'end'), None))
-                position = _extract_pos(next((c for c in loc if (c.tag.split('}')[-1] if '}' in c.tag else c.tag) == 'position'), None))
+                begin = _extract_pos(next((c for c in loc if _local(c.tag) == 'begin'), None))
+                end = _extract_pos(next((c for c in loc if _local(c.tag) == 'end'), None))
+                position = _extract_pos(next((c for c in loc if _local(c.tag) == 'position'), None))
 
                 start = begin if begin is not None else position
                 end_val = end if end is not None else position
 
                 if start is not None and end_val is not None:
                     result['domains'].append({
-                        'type': el.get('type', ''),
-                        'description': el.get('description', ''),
+                        'type': child.get('type', ''),
+                        'description': child.get('description', ''),
                         'start': start,
                         'end': end_val,
                     })
@@ -391,148 +428,291 @@ def parse_entry_xml(root, go_dict, uniprot_dict):
     return result
 
 
-def _is_source_indexed(conn, source_name):
-    """Return True if source_name has been fully indexed in this DB."""
-    conn.execute(
-        'CREATE TABLE IF NOT EXISTS source_progress '
-        '(source_name TEXT PRIMARY KEY, completed_at TEXT NOT NULL)'
-    )
-    conn.commit()
-    row = conn.execute(
-        'SELECT completed_at FROM source_progress WHERE source_name = ?', (source_name,)
-    ).fetchone()
-    return row is not None
+
+def _source_tmp_path(db_file, source_name):
+    """Return the per-source tmp DB path, e.g. uniprot_index_swissprot.tmp.db"""
+    base, ext = os.path.splitext(db_file)
+    slug = source_name.lower().replace('-', '')  # 'swissprot' or 'trembl'
+    return f'{base}_{slug}.tmp{ext}'
 
 
-def _mark_source_indexed(conn, source_name):
-    """Record that source_name has been fully indexed."""
-    import datetime
-    conn.execute(
-        'INSERT OR REPLACE INTO source_progress(source_name, completed_at) VALUES (?, ?)',
-        (source_name, datetime.datetime.utcnow().isoformat()),
+def _open_xml_source(url, local_path, source_name, has_pigz):
+    """Return a binary stream of decompressed UniProt XML.
+
+    For local files: uses pigz (parallel, fast) when available.
+    For streaming: uses curl → Python gzip.open (pigz on a pipe is unreliable
+    because lxml closing the read end mid-stream causes SIGPIPE in pigz/curl).
+    lxml.iterparse requires a binary stream; gzip.open('rb') returns bytes.
+    """
+    _BUFSIZE = 1 << 23  # 8 MB read buffer
+
+    if os.path.exists(local_path):
+        size_gb = os.path.getsize(local_path) / (1024 ** 3)
+        if has_pigz:
+            _console.print(f'  Using local file: [green]{local_path}[/] ({size_gb:.1f} GB) via [bold]pigz[/]')
+            proc = subprocess.Popen(
+                ['pigz', '-d', '-c', local_path],
+                stdout=subprocess.PIPE, stderr=sys.stderr, bufsize=_BUFSIZE,
+            )
+            return proc.stdout
+        _console.print(f'  Using local file: [green]{local_path}[/] ({size_gb:.1f} GB)')
+        return gzip.open(local_path, 'rb')
+
+    # Streaming: curl → gzip.open (Python's gzip handles multi-member streams
+    # correctly and doesn't suffer from SIGPIPE issues with lxml).
+    _console.print(f'  Streaming [bold]{source_name}[/] directly from UniProt FTP…')
+    proc = subprocess.Popen(
+        ['curl', '-L', '--retry', '10', '--retry-delay', '5',
+         '--retry-max-time', '3600', '--silent', '--show-error', url],
+        stdout=subprocess.PIPE, stderr=sys.stderr, bufsize=_BUFSIZE,
     )
-    conn.commit()
+    gz = gzip.open(proc.stdout, 'rb')
+    # Wrap in an anonymous RawIOBase so lxml cannot resolve a .name attribute
+    # to a file path (an empty .name resolves to CWD, causing XMLSyntaxError).
+    class _AnonRaw(io.RawIOBase):
+        def readinto(self, b):
+            # RawIOBase.readinto must return exactly 0 only on EOF,
+            # never a short read mid-stream, or BufferedReader signals EOF.
+            data = gz.read(len(b))
+            if not data:
+                return 0
+            n = len(data)
+            b[:n] = data
+            return n
+        def readable(self):
+            return True
+    return io.BufferedReader(_AnonRaw(), buffer_size=_BUFSIZE)
 
 
 def setup_uniprot_database(go_dict, uniprot_dict, db_file=UNIPROT_DB_FILE):
-    """Stream and index Swiss-Prot + TrEMBL into SQLite."""
-    conn = sqlite3.connect(db_file)
-    conn.execute(f'PRAGMA journal_mode = {PRAGMA_JOURNAL_MODE}')
-    conn.execute(f'PRAGMA synchronous = {PRAGMA_SYNCHRONOUS}')
-    conn.execute(f'PRAGMA cache_size = {PRAGMA_CACHE_SIZE}')
-    conn.execute('PRAGMA temp_store = MEMORY')
-    conn.execute('CREATE TABLE IF NOT EXISTS entries '
-                 '(accession TEXT PRIMARY KEY, reviewed INTEGER NOT NULL, organism TEXT NOT NULL, data BLOB NOT NULL)')
-    conn.commit()
+    """Stream and index Swiss-Prot + TrEMBL into SQLite.
+
+    Each source is written to its own per-source .tmp.db file and only promoted
+    (kept) once that source completes. If a source was interrupted its .tmp.db is
+    discarded and re-indexed. Once both sources are done they are merged into the
+    final db_file and the per-source tmps are removed.
+    """
+    # Already fully built — nothing to do.
+    if os.path.exists(db_file):
+        _console.print('[bold green]✓[/] All sources already indexed — skipping setup_uniprot_database.')
+        return
 
     _console.print(f'[bold cyan]Building UniProt database:[/] [green]{db_file}[/]')
 
-    upsert_sql = (
-        'INSERT OR REPLACE INTO entries(accession, reviewed, organism, data) VALUES (?,?,?,?)'
-    )
-
-    all_done = all(_is_source_indexed(conn, 'Swiss-Prot' if f == 1 else 'TrEMBL') for _, _, f in UNIPROT_SOURCES)
-    if all_done:
-        _console.print('[bold green]✓[/] All sources already indexed — skipping setup_uniprot_database.')
-        conn.close()
-        return
+    _HAS_PIGZ = subprocess.run(['which', 'pigz'], capture_output=True).returncode == 0
+    if _HAS_PIGZ:
+        _console.print('  [dim]pigz detected — using parallel decompression for local files[/dim]')
+    if _USING_LXML:
+        _console.print('  [dim]lxml detected — using fast XML parser[/dim]')
 
     _console.print('[dim]Fetching online UniProt entry counts…[/]')
     online_totals = _fetch_online_uniprot_totals()
+
+    # Track per-source completed tmp paths for the final merge step.
+    completed_tmps = {}  # source_name -> tmp_path
 
     for url, xml_file, reviewed_flag in UNIPROT_SOURCES:
         source_name  = 'Swiss-Prot' if reviewed_flag == 1 else 'TrEMBL'
         source_color = 'yellow' if reviewed_flag == 1 else 'cyan'
         total_entries = online_totals.get(reviewed_flag)
+        tmp_path = _source_tmp_path(db_file, source_name)
+        done_marker = tmp_path + '.done'
 
-        if _is_source_indexed(conn, source_name):
+        if os.path.exists(done_marker) and os.path.exists(tmp_path):
             _console.print(f'  [bold green]✓[/] [{source_color}]{source_name}[/] already indexed — skipping.')
+            completed_tmps[source_name] = tmp_path
             continue
 
-        def _open_source(url=url, local_path=xml_file):
-            if os.path.exists(local_path):
-                size_gb = os.path.getsize(local_path) / (1024 ** 3)
-                _console.print(f'  Using local file: [green]{local_path}[/] ({size_gb:.1f} GB)')
-                return gzip.open(local_path, 'rt', encoding='utf-8', errors='ignore')
+        # Keep any partial tmp from a previous interrupted run — we resume from it.
+        # Only discard the done_marker (it can't exist here since we passed the check above).
+        if os.path.exists(done_marker):
+            os.remove(done_marker)
 
-            # Stream via curl stdout → gzip → iterparse (no disk, starts immediately).
-            _console.print(f'  Streaming [bold]{source_name}[/] directly from UniProt FTP…')
-            proc = subprocess.Popen(
-                ['curl', '-L', '--retry', '10', '--retry-delay', '5',
-                 '--retry-max-time', '3600', '--silent', '--show-error', url],
-                stdout=subprocess.PIPE, stderr=sys.stderr,
-            )
-            return gzip.open(proc.stdout, 'rt', encoding='utf-8', errors='ignore')
-
-        n, batch = 0, []
-
-        src_file = _open_source()
-
-        index_progress = Progress(
-            SpinnerColumn(),
-            TextColumn(f'  [{source_color}][bold]{source_name}[/bold][/{source_color}]'),
-            BarColumn(bar_width=45),
-            MofNCompleteColumn(),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            TextColumn('[dim]eta[/dim]'),
-            TimeRemainingColumn(),
-            TextColumn('[dim]{task.fields[ram]}[/dim]'),
-            console=_console,
-            transient=False,
+        upsert_sql = (
+            'INSERT OR IGNORE INTO entries(accession, reviewed, organism, data) VALUES (?,?,?,?)'
         )
-        task_id = index_progress.add_task(source_name, total=total_entries, ram='decompressing…')
 
-        try:
-            with index_progress:
-                with src_file as f:
-                    for event, elem in etree.iterparse(f, events=('end',)):
-                        if not (elem.tag.endswith('}entry') or elem.tag == 'entry'):
-                            continue
+        _MAX_RETRIES = 20
+        _RETRY_DELAY = 30  # seconds between retries
 
-                        try:
-                            accs = [acc.text for acc in elem.iter() if
-                                   (acc.tag.endswith('}accession') or acc.tag == 'accession') and acc.text]
-
-                            if accs:
-                                parsed = parse_entry_xml(elem, go_dict, uniprot_dict)
-                                data_blob = pickle.dumps(parsed, protocol=5)
-                                organism = parsed.get('organism', '')
-                                batch.extend((acc, reviewed_flag, organism, data_blob) for acc in accs)
-                                n += 1
-                                if n == 1:
-                                    index_progress.update(task_id, ram='RAM: —')
-                                index_progress.advance(task_id)
-
-                                if n % 10000 == 0:
-                                    mem_gb = ram_used_gb()
-                                    ram_str = (f'RAM: {mem_gb:.1f}/{_TOTAL_MEM_GB:.0f} GB'
-                                               if mem_gb else 'RAM: —')
-                                    index_progress.update(task_id, ram=ram_str)
-                                    check_memory_safety('indexing')
-                                    if mem_gb is not None and mem_gb >= FLUSH_RAM_LIMIT_GB:
-                                        conn.executemany(upsert_sql, batch)
-                                        conn.commit()
-                                        batch = []
-                                        gc.collect()
-                        except Exception:
-                            pass
-                        finally:
-                            elem.clear()
-        finally:
-            safe_collect()
-
-        if batch:
-            conn.executemany(upsert_sql, batch)
+        for _attempt in range(1, _MAX_RETRIES + 1):
+            conn = sqlite3.connect(tmp_path)
+            conn.execute('PRAGMA page_size = 16384')
+            conn.execute(f'PRAGMA journal_mode = {PRAGMA_JOURNAL_MODE}')
+            conn.execute(f'PRAGMA synchronous = {PRAGMA_SYNCHRONOUS}')
+            conn.execute(f'PRAGMA cache_size = {PRAGMA_CACHE_SIZE}')
+            conn.execute('PRAGMA temp_store = MEMORY')
+            conn.execute('CREATE TABLE IF NOT EXISTS entries '
+                         '(accession TEXT PRIMARY KEY, reviewed INTEGER NOT NULL, '
+                         'organism TEXT NOT NULL, data BLOB NOT NULL)')
             conn.commit()
-        _mark_source_indexed(conn, source_name)
-        _console.print(f'  [bold green]✓[/] [{source_color}]{source_name}[/]: [bold]{n:,}[/] entries indexed.')
+
+            # Count already-persisted rows so progress display is accurate on resume.
+            already_done = conn.execute('SELECT COUNT(*) FROM entries').fetchone()[0]
+
+            n, batch = already_done, []
+
+            if already_done > 0:
+                _console.print(
+                    f'  [dim][{source_color}]{source_name}[/{source_color}] resuming from '
+                    f'{already_done:,} already-indexed entries (attempt {_attempt}/{_MAX_RETRIES})…[/dim]'
+                )
+
+            src_file = _open_xml_source(url, xml_file, source_name, _HAS_PIGZ)
+
+            index_progress = Progress(
+                SpinnerColumn(),
+                TextColumn(f'  [{source_color}][bold]{source_name}[/bold][/{source_color}]'),
+                BarColumn(bar_width=30),
+                MofNCommaColumn(),
+                TaskProgressColumn(),
+                EntriesPerSecondColumn(),
+                TimeElapsedColumn(),
+                TextColumn('[dim]eta[/dim]'),
+                TimeRemainingColumn(),
+                TextColumn('[dim]{task.fields[ram]}[/dim]'),
+                console=_console,
+                transient=False,
+            )
+            task_id = index_progress.add_task(source_name, total=total_entries, ram='decompressing…',
+                                              completed=already_done)
+
+            _stream_error = None
+            try:
+                with index_progress:
+                    with src_file as f:
+                        _iterparse = etree.iterparse(
+                            f,
+                            events=('end',),
+                        )
+                        for event, elem in _iterparse:
+                            tag_local = _local(elem.tag)
+
+                            if tag_local != 'entry':
+                                continue
+
+                            try:
+                                # Accessions are always direct children of <entry> — no need to walk descendants
+                                accs = [c.text for c in elem if _local(c.tag) == 'accession' and c.text]
+
+                                if accs:
+                                    parsed = parse_entry_xml(elem, go_dict, uniprot_dict)
+                                    data_blob = pickle.dumps(parsed, protocol=5)
+                                    organism = parsed.get('organism', '')
+                                    # Only insert primary accession (accs[0]); secondary accessions
+                                    # point to the same record — avoids duplicating the blob N times.
+                                    batch.append((accs[0], reviewed_flag, organism, data_blob))
+                                    n += 1
+                                    if n == already_done + 1:
+                                        index_progress.update(task_id, ram='RAM: —')
+                                    index_progress.advance(task_id)
+
+                                    if n % 10000 == 0:
+                                        mem_gb = ram_used_gb()
+                                        ram_str = (f'RAM: {mem_gb:.1f}/{_TOTAL_MEM_GB:.0f} GB'
+                                                   if mem_gb else 'RAM: —')
+                                        index_progress.update(task_id, ram=ram_str)
+                                        check_memory_safety('indexing')
+                                        if (mem_gb is not None and mem_gb >= FLUSH_RAM_LIMIT_GB) or len(batch) >= 50000:
+                                            conn.executemany(upsert_sql, batch)
+                                            conn.commit()
+                                            batch = []
+                                            gc.collect()
+                            except Exception:
+                                pass
+                            finally:
+                                # Clear processed entry element to free memory.
+                                # Do NOT clear _doc_root[:] — removing children from the
+                                # root while lxml is still parsing causes XMLSyntaxError.
+                                elem.clear()
+            except _XMLSyntaxError as exc:
+                # lxml raises XMLSyntaxError when the underlying stream is truncated
+                # (e.g. a broken pipe from curl/pigz). Flush whatever we have, then retry.
+                _stream_error = exc
+            finally:
+                if batch:
+                    conn.executemany(upsert_sql, batch)
+                    conn.commit()
+                    batch = []
+                conn.close()
+                gc.collect()
+
+            if _stream_error is not None:
+                _console.print(
+                    f'  [bold yellow]⚠[/] [{source_color}]{source_name}[/{source_color}] stream '
+                    f'truncated after {n:,} entries (lxml: {_stream_error}). '
+                    f'Saved progress. Retrying in {_RETRY_DELAY}s '
+                    f'(attempt {_attempt}/{_MAX_RETRIES})…'
+                )
+                import time as _time
+                _time.sleep(_RETRY_DELAY)
+                continue  # retry
+
+            # No stream error — source completed successfully.
+            break
+        else:
+            raise RuntimeError(
+                f'{source_name} stream kept truncating after {_MAX_RETRIES} attempts. '
+                f'Last known progress: {n:,} entries. Check network/disk and re-run.'
+            )
+
+        # Re-open to get final count for display
+        _final_conn = sqlite3.connect(tmp_path)
+        _final_n = _final_conn.execute('SELECT COUNT(*) FROM entries').fetchone()[0]
+        _final_conn.close()
+
+        # Mark this source as complete with a sentinel file.
+        open(done_marker, 'w').close()
+        completed_tmps[source_name] = tmp_path
+        _console.print(f'  [bold green]✓[/] [{source_color}]{source_name}[/]: [bold]{_final_n:,}[/] entries indexed.')
         safe_collect()
 
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_accession ON entries(accession)')
-    conn.commit()
+    # ── Verify all sources completed before merging ────────────────────────────
+    expected_sources = {('Swiss-Prot' if reviewed == 1 else 'TrEMBL') for _, _, reviewed in UNIPROT_SOURCES}
+    missing_sources = expected_sources - set(completed_tmps.keys())
+    if missing_sources:
+        raise RuntimeError(
+            f'Cannot build final database: the following sources did not complete: '
+            f'{", ".join(sorted(missing_sources))}. Re-run to retry.'
+        )
 
-    conn.close()
+    # ── Merge per-source tmp DBs into the final DB ─────────────────────────────
+    _console.print('[dim]Merging sources into final database…[/dim]')
+    merge_tmp = db_file + '.merge.tmp'
+    if os.path.exists(merge_tmp):
+        os.remove(merge_tmp)
+
+    final_conn = sqlite3.connect(merge_tmp)
+    final_conn.execute('PRAGMA page_size = 16384')
+    final_conn.execute(f'PRAGMA journal_mode = {PRAGMA_JOURNAL_MODE}')
+    final_conn.execute(f'PRAGMA synchronous = {PRAGMA_SYNCHRONOUS}')
+    final_conn.execute(f'PRAGMA cache_size = {PRAGMA_CACHE_SIZE}')
+    final_conn.execute('PRAGMA temp_store = MEMORY')
+    final_conn.execute('CREATE TABLE entries '
+                       '(accession TEXT PRIMARY KEY, reviewed INTEGER NOT NULL, '
+                       'organism TEXT NOT NULL, data BLOB NOT NULL)')
+    final_conn.commit()
+
+    for source_name, tmp_path in completed_tmps.items():
+        source_color = 'yellow' if source_name == 'Swiss-Prot' else 'cyan'
+        _console.print(f'  Merging [{source_color}]{source_name}[/]…')
+        final_conn.execute(f"ATTACH DATABASE '{tmp_path}' AS src")
+        final_conn.execute(
+            'INSERT OR IGNORE INTO entries SELECT accession, reviewed, organism, data FROM src.entries'
+        )
+        final_conn.commit()
+        final_conn.execute('DETACH DATABASE src')
+
+    final_conn.close()
+    os.replace(merge_tmp, db_file)
+
+    # Clean up per-source tmps now that the final DB is ready.
+    for source_name, tmp_path in completed_tmps.items():
+        done_marker = tmp_path + '.done'
+        for f in (tmp_path, done_marker):
+            if os.path.exists(f):
+                os.remove(f)
+
     _console.print('[bold green]✓[/] UniProt database ready.')
 
 
@@ -769,9 +949,9 @@ def main():
     _console.print(f'  [green]✓[/] GO→UniProt mappings: [bold]{len(go_dict):,}[/]')
 
     mem_info = (
-        f'[bold]{_TOTAL_MEM_GB:.1f} GB[/] RAM  '
-        f'flush @ [yellow]{FLUSH_RAM_PCT*100:.0f}%[/] ({FLUSH_RAM_LIMIT_GB:.1f} GB)  '
-        f'hard limit @ [red]{MEMORY_HARD_LIMIT_PCT*100:.0f}%[/] ({MEMORY_HARD_LIMIT_GB:.1f} GB)'
+        f'[bold]{_TOTAL_MEM_GB:.1f} GB[/] total RAM  '
+        f'process flush @ [yellow]{FLUSH_RAM_PCT*100:.0f}%[/] ({FLUSH_RAM_LIMIT_GB:.1f} GB)  '
+        f'process hard limit @ [red]{MEMORY_HARD_LIMIT_PCT*100:.0f}%[/] ({MEMORY_HARD_LIMIT_GB:.1f} GB)'
     )
     _console.print(f'\n  [dim]System:[/dim] {mem_info}')
 
@@ -815,9 +995,10 @@ def main():
     overall_progress = Progress(
         SpinnerColumn(),
         TextColumn('[bold magenta]Overall[/bold magenta]'),
-        BarColumn(bar_width=45),
-        MofNCompleteColumn(),
+        BarColumn(bar_width=30),
+        MofNCommaColumn(),
         TaskProgressColumn(),
+        EntriesPerSecondColumn(),
         TimeElapsedColumn(),
         TextColumn('[dim]eta[/dim]'),
         TimeRemainingColumn(),
@@ -828,9 +1009,10 @@ def main():
     batch_progress = Progress(
         SpinnerColumn(),
         TextColumn('  [cyan]{task.description}[/cyan]'),
-        BarColumn(bar_width=40),
-        MofNCompleteColumn(),
+        BarColumn(bar_width=25),
+        MofNCommaColumn(),
         TaskProgressColumn(),
+        EntriesPerSecondColumn(),
         TimeElapsedColumn(),
         TextColumn('[dim]{task.fields[ram]}[/dim]'),
         console=_console,
