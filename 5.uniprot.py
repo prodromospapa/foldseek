@@ -3,6 +3,7 @@ import gc
 import gzip
 import io
 import json
+import multiprocessing
 import os
 import pickle
 import re
@@ -92,7 +93,7 @@ MEMORY_HARD_LIMIT_PCT = 0.40   # Crash if usage exceeds this
 SQLITE_PARAM_LIMIT  = 900
 PRAGMA_CACHE_SIZE   = -1000000
 PRAGMA_JOURNAL_MODE = 'WAL'
-PRAGMA_SYNCHRONOUS  = 'OFF'
+PRAGMA_SYNCHRONOUS  = 'NORMAL'
 
 UNIPROT_SOURCES = [
     ('https://ftp.ebi.ac.uk/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.xml.gz',
@@ -484,6 +485,43 @@ def _open_xml_source(url, local_path, source_name, has_pigz):
     return io.BufferedReader(_AnonRaw(), buffer_size=_BUFSIZE)
 
 
+def _index_worker(xml_chunks, reviewed_flag, tmp_path, go_dict, uniprot_dict):
+    """Worker subprocess: parse a list of raw <entry> XML byte strings and insert into tmp_path.
+
+    Runs in a separate process so the OS reclaims all parse memory on exit.
+    xml_chunks: list of bytes, one per <entry> element.
+    """
+    upsert_sql = (
+        'INSERT OR IGNORE INTO entries(accession, reviewed, organism, data) VALUES (?,?,?,?)'
+    )
+    conn = sqlite3.connect(tmp_path)
+    conn.execute(f'PRAGMA journal_mode = {PRAGMA_JOURNAL_MODE}')
+    conn.execute(f'PRAGMA synchronous = {PRAGMA_SYNCHRONOUS}')
+    conn.execute(f'PRAGMA cache_size = {PRAGMA_CACHE_SIZE}')
+    conn.execute('PRAGMA temp_store = MEMORY')
+
+    batch = []
+    for raw_xml in xml_chunks:
+        try:
+            if _USING_LXML:
+                elem = etree.fromstring(raw_xml)
+            else:
+                elem = etree.fromstring(raw_xml.decode('utf-8', errors='replace'))
+            accs = [c.text for c in elem if _local(c.tag) == 'accession' and c.text]
+            if accs:
+                parsed = parse_entry_xml(elem, go_dict, uniprot_dict)
+                data_blob = pickle.dumps(parsed, protocol=5)
+                organism = parsed.get('organism', '')
+                batch.append((accs[0], reviewed_flag, organism, data_blob))
+        except Exception:
+            pass
+
+    if batch:
+        conn.executemany(upsert_sql, batch)
+        conn.commit()
+    conn.close()
+
+
 def setup_uniprot_database(go_dict, uniprot_dict, db_file=UNIPROT_DB_FILE):
     """Stream and index Swiss-Prot + TrEMBL into SQLite.
 
@@ -536,21 +574,20 @@ def setup_uniprot_database(go_dict, uniprot_dict, db_file=UNIPROT_DB_FILE):
         _RETRY_DELAY = 30  # seconds between retries
 
         for _attempt in range(1, _MAX_RETRIES + 1):
-            conn = sqlite3.connect(tmp_path)
-            conn.execute('PRAGMA page_size = 16384')
-            conn.execute(f'PRAGMA journal_mode = {PRAGMA_JOURNAL_MODE}')
-            conn.execute(f'PRAGMA synchronous = {PRAGMA_SYNCHRONOUS}')
-            conn.execute(f'PRAGMA cache_size = {PRAGMA_CACHE_SIZE}')
-            conn.execute('PRAGMA temp_store = MEMORY')
-            conn.execute('CREATE TABLE IF NOT EXISTS entries '
-                         '(accession TEXT PRIMARY KEY, reviewed INTEGER NOT NULL, '
-                         'organism TEXT NOT NULL, data BLOB NOT NULL)')
-            conn.commit()
+            # Open connection only to initialise the table and read resume count,
+            # then close it so the worker subprocess has exclusive access.
+            _init_conn = sqlite3.connect(tmp_path)
+            _init_conn.execute('PRAGMA page_size = 16384')
+            _init_conn.execute(f'PRAGMA journal_mode = {PRAGMA_JOURNAL_MODE}')
+            _init_conn.execute(f'PRAGMA synchronous = {PRAGMA_SYNCHRONOUS}')
+            _init_conn.execute('CREATE TABLE IF NOT EXISTS entries '
+                               '(accession TEXT PRIMARY KEY, reviewed INTEGER NOT NULL, '
+                               'organism TEXT NOT NULL, data BLOB NOT NULL)')
+            _init_conn.commit()
+            already_done = _init_conn.execute('SELECT COUNT(*) FROM entries').fetchone()[0]
+            _init_conn.close()
 
-            # Count already-persisted rows so progress display is accurate on resume.
-            already_done = conn.execute('SELECT COUNT(*) FROM entries').fetchone()[0]
-
-            n, batch = already_done, []
+            n = already_done
 
             if already_done > 0:
                 _console.print(
@@ -577,64 +614,83 @@ def setup_uniprot_database(go_dict, uniprot_dict, db_file=UNIPROT_DB_FILE):
             task_id = index_progress.add_task(source_name, total=total_entries, ram='decompressing…',
                                               completed=already_done)
 
+            def _dispatch_chunk(xml_chunk):
+                """Send xml_chunk to a worker subprocess and wait for it to finish."""
+                proc = multiprocessing.Process(
+                    target=_index_worker,
+                    args=(xml_chunk, reviewed_flag, tmp_path, go_dict, uniprot_dict),
+                )
+                proc.start()
+                proc.join()
+                if proc.exitcode != 0:
+                    raise RuntimeError(
+                        f'Index worker exited with code {proc.exitcode}'
+                    )
+
             _stream_error = None
+            # stream_pos counts every <entry> element seen in the stream this attempt,
+            # so we can fast-skip the first already_done entries without parsing them.
+            stream_pos = 0
+            xml_chunk = []  # raw <entry> XML bytes accumulated for the next worker dispatch
             try:
                 with index_progress:
                     with src_file as f:
-                        _iterparse = etree.iterparse(
-                            f,
-                            events=('end',),
-                        )
+                        _iterparse = etree.iterparse(f, events=('end',))
                         for event, elem in _iterparse:
                             tag_local = _local(elem.tag)
 
                             if tag_local != 'entry':
                                 continue
 
-                            try:
-                                # Accessions are always direct children of <entry> — no need to walk descendants
-                                accs = [c.text for c in elem if _local(c.tag) == 'accession' and c.text]
-
-                                if accs:
-                                    parsed = parse_entry_xml(elem, go_dict, uniprot_dict)
-                                    data_blob = pickle.dumps(parsed, protocol=5)
-                                    organism = parsed.get('organism', '')
-                                    # Only insert primary accession (accs[0]); secondary accessions
-                                    # point to the same record — avoids duplicating the blob N times.
-                                    batch.append((accs[0], reviewed_flag, organism, data_blob))
-                                    n += 1
-                                    if n == already_done + 1:
-                                        index_progress.update(task_id, ram='RAM: —')
-                                    index_progress.advance(task_id)
-
-                                    if n % 10000 == 0:
-                                        mem_gb = ram_used_gb()
-                                        ram_str = (f'RAM: {mem_gb:.1f}/{_TOTAL_MEM_GB:.0f} GB'
-                                                   if mem_gb else 'RAM: —')
-                                        index_progress.update(task_id, ram=ram_str)
-                                        check_memory_safety('indexing')
-                                        if (mem_gb is not None and mem_gb >= FLUSH_RAM_LIMIT_GB) or len(batch) >= 50000:
-                                            conn.executemany(upsert_sql, batch)
-                                            conn.commit()
-                                            batch = []
-                                            gc.collect()
-                            except Exception:
-                                pass
-                            finally:
-                                # Clear processed entry element to free memory.
-                                # Do NOT clear _doc_root[:] — removing children from the
-                                # root while lxml is still parsing causes XMLSyntaxError.
+                            # Skip entries already persisted in a previous interrupted attempt.
+                            # The stream order is deterministic (static FTP file), so position
+                            # is a reliable proxy for identity — no accession lookup needed.
+                            if stream_pos < already_done:
+                                stream_pos += 1
                                 elem.clear()
+                                if stream_pos % 1 == 0:
+                                    index_progress.update(task_id, completed=stream_pos,
+                                                          ram='skipping…')
+                                continue
+                            stream_pos += 1
+
+                            # Capture raw XML bytes before clearing the element.
+                            xml_chunk.append(etree.tostring(elem))
+                            elem.clear()
+
+                            n += 1
+                            if n == already_done + 1:
+                                mem_gb = ram_used_gb()
+                                index_progress.update(
+                                    task_id,
+                                    ram=(f'RAM: {mem_gb:.1f}/{_TOTAL_MEM_GB:.0f} GB' if mem_gb else 'RAM: —'),
+                                )
+                            index_progress.advance(task_id)
+
+                            # Check RAM every 1000 entries; dispatch worker if limit approached.
+                            if n % 1000 == 0:
+                                mem_gb = ram_used_gb()
+                                ram_str = (f'RAM: {mem_gb:.1f}/{_TOTAL_MEM_GB:.0f} GB'
+                                           if mem_gb else 'RAM: —')
+                                index_progress.update(task_id, ram=ram_str)
+                                if mem_gb is not None and mem_gb >= FLUSH_RAM_LIMIT_GB:
+                                    _dispatch_chunk(xml_chunk)
+                                    xml_chunk = []
+                                    gc.collect()
+
+                        # Dispatch any remaining entries at end of stream.
+                        if xml_chunk:
+                            _dispatch_chunk(xml_chunk)
+                            xml_chunk = []
+
             except _XMLSyntaxError as exc:
                 # lxml raises XMLSyntaxError when the underlying stream is truncated
-                # (e.g. a broken pipe from curl/pigz). Flush whatever we have, then retry.
+                # (e.g. a broken pipe from curl/pigz). Dispatch whatever we have, then retry.
+                if xml_chunk:
+                    _dispatch_chunk(xml_chunk)
+                    xml_chunk = []
                 _stream_error = exc
             finally:
-                if batch:
-                    conn.executemany(upsert_sql, batch)
-                    conn.commit()
-                    batch = []
-                conn.close()
                 gc.collect()
 
             if _stream_error is not None:
