@@ -396,6 +396,25 @@ async def process_all_files():
         processed_ids = set(
             existing_df[["query_ensembl_id", "query_chain_id"]].apply(tuple, axis=1)
         )
+        # Pre-populate the UniProt cache from already-fetched data so we don't
+        # re-hit the API for IDs we've already resolved in a previous run.
+        for col, rev_col in [
+            ("target_uniprot_id", "target_uniprot_reviewed"),
+            ("target_dimer_uniprot_id", "target_dimer_uniprot_reviewed"),
+        ]:
+            if col in existing_df.columns and rev_col in existing_df.columns:
+                for uid, reviewed in (
+                    existing_df[[col, rev_col]]
+                    .dropna(subset=[col])
+                    .drop_duplicates(subset=[col])
+                    .itertuples(index=False)
+                ):
+                    base = str(uid).split("-")[0]
+                    if base not in _uniprot_task_cache:
+                        iso_num = "1"
+                        async def _cached(i=iso_num, r=bool(reviewed)):
+                            return i, r
+                        _uniprot_task_cache[base] = asyncio.ensure_future(_cached())
     else:
         existing_df = pd.DataFrame()
         processed_ids = set()

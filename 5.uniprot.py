@@ -369,7 +369,10 @@ def parse_entry_xml(root, go_dict, uniprot_dict):
             dbid = child.get('id')
             if dbtype and dbid:
                 if dbtype == 'Ensembl' and not result['ensembl_id']:
-                    result['ensembl_id'] = dbid.split('.')[0]
+                    for prop in child:
+                        if _local(prop.tag) == 'property' and prop.get('type') == 'gene ID':
+                            result['ensembl_id'] = (prop.get('value') or '').split('.')[0]
+                            break
                 elif dbtype == 'PANTHER':
                     result['panthr_id'].append(dbid)
                 elif dbtype == 'GO':
@@ -635,23 +638,70 @@ def setup_uniprot_database(go_dict, uniprot_dict, db_file=UNIPROT_DB_FILE):
             try:
                 with index_progress:
                     with src_file as f:
-                        _iterparse = etree.iterparse(f, events=('end',))
+                        # Fast-skip already_done entries by counting </entry> bytes
+                        # instead of full XML parsing — orders of magnitude faster.
+                        if already_done > 0:
+                            END_TAG = b'</entry>'
+                            READ_SIZE = 1 << 20  # 1 MiB chunks
+                            tail = b''  # bytes after the last </entry> found
+                            while stream_pos < already_done:
+                                chunk = f.read(READ_SIZE)
+                                if not chunk:
+                                    break
+                                data = tail + chunk
+                                pos = 0
+                                while True:
+                                    idx = data.find(END_TAG, pos)
+                                    if idx == -1:
+                                        tail = data[max(0, len(data) - len(END_TAG) + 1):]
+                                        break
+                                    pos = idx + len(END_TAG)
+                                    stream_pos += 1
+                                    if stream_pos % 50_000 == 0:
+                                        index_progress.update(task_id, completed=stream_pos,
+                                                              ram='skipping…')
+                                    if stream_pos >= already_done:
+                                        tail = data[pos:]
+                                        break
+                            # tail holds bytes after the already_done-th </entry>;
+                            # f has the rest of the stream. Wrap both into a stream
+                            # that lxml iterparse can consume as a valid XML document.
+                            # We re-open with a synthetic root so lxml stays happy.
+                            XML_PREFIX = b'<?xml version="1.0"?><uniprot xmlns="http://uniprot.org/uniprot">'
+                            _buf_iter = [XML_PREFIX + tail]
+                            _underlying = f
+
+                            class _ResumeRaw(io.RawIOBase):
+                                def readinto(self, b):
+                                    if _buf_iter:
+                                        src = _buf_iter[0]
+                                        n = min(len(src), len(b))
+                                        b[:n] = src[:n]
+                                        if n == len(src):
+                                            _buf_iter.pop(0)
+                                        else:
+                                            _buf_iter[0] = src[n:]
+                                        return n
+                                    data = _underlying.read(len(b))
+                                    if not data:
+                                        return 0
+                                    n = len(data)
+                                    b[:n] = data
+                                    return n
+                                def readable(self):
+                                    return True
+
+                            parse_stream = io.BufferedReader(_ResumeRaw(), buffer_size=1 << 23)
+                        else:
+                            parse_stream = f
+
+                        _iterparse = etree.iterparse(parse_stream, events=('end',))
                         for event, elem in _iterparse:
                             tag_local = _local(elem.tag)
 
                             if tag_local != 'entry':
                                 continue
 
-                            # Skip entries already persisted in a previous interrupted attempt.
-                            # The stream order is deterministic (static FTP file), so position
-                            # is a reliable proxy for identity — no accession lookup needed.
-                            if stream_pos < already_done:
-                                stream_pos += 1
-                                elem.clear()
-                                if stream_pos % 1 == 0:
-                                    index_progress.update(task_id, completed=stream_pos,
-                                                          ram='skipping…')
-                                continue
                             stream_pos += 1
 
                             # Capture raw XML bytes before clearing the element.
@@ -854,7 +904,9 @@ def load_results():
     """Load the annotated results DataFrame, rebuilding from base if needed."""
     if os.path.exists(ANNOTATED_FILE):
         try:
+            _console.print(f'  [dim]Loading annotated results: {ANNOTATED_FILE}…[/dim]')
             df = pd.read_pickle(ANNOTATED_FILE)
+            _console.print(f'  [dim]Loading base results: {RESULTS_FILE}…[/dim]')
             base_df = pd.read_pickle(RESULTS_FILE)
             if 'target_reviewed' not in df.columns or len(df) != len(base_df):
                 _console.print('[yellow]Detected legacy results file; rebuilding from base results.[/]')
@@ -862,8 +914,10 @@ def load_results():
             del base_df
         except (EOFError, pickle.UnpicklingError):
             _console.print('[red]Corrupted annotated results file; rebuilding.[/]')
+            _console.print(f'  [dim]Loading base results: {RESULTS_FILE}…[/dim]')
             df = pd.read_pickle(RESULTS_FILE)
     else:
+        _console.print(f'  [dim]Loading base results: {RESULTS_FILE}…[/dim]')
         df = pd.read_pickle(RESULTS_FILE)
 
     # Remove obsolete columns
@@ -1038,9 +1092,11 @@ def main():
         f'[yellow]pending: {len(pending_ids):,}[/]'
     )
 
+    _console.print('  [dim]Building ID index maps…[/dim]')
     query_map  = df.groupby('query_uniprot_id').groups
     target_map = df.groupby('target_uniprot_id').groups
     dimer_map  = df.groupby('target_dimer_uniprot_id').groups
+    _console.print('  [green]✓[/] ID index maps ready')
 
     pending_list  = sorted(pending_ids)
     batch_num     = 0
